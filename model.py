@@ -1,5 +1,5 @@
 # Full PyTorch training pipeline for elbow X-ray fracture (Yes/No) → VLM (T5+LoRA)
-# Updated for MURA dataset directory structure
+# Updated for MURA dataset directory structure and CPU compatibility
 
 import os
 import torch
@@ -12,6 +12,10 @@ from transformers import T5Tokenizer, T5ForConditionalGeneration
 from peft import get_peft_model, LoraConfig, TaskType
 from sklearn.metrics import roc_auc_score, f1_score, accuracy_score, confusion_matrix
 import numpy as np
+
+# Set device to CPU
+device = torch.device('cpu')
+print("Using device:", device)
 
 # -----------------------------
 # 1. Create CSV from directory structure
@@ -108,9 +112,10 @@ img_tf = transforms.Compose([
 # 4. Vision Encoder
 # -----------------------------
 vision_backbone = timm.create_model('vit_base_patch16_224', pretrained=True, num_classes=0)  # Remove classification head
-vision_backbone.eval().cuda()
+vision_backbone = vision_backbone.to(device)
+vision_backbone.eval()
 
-proj = torch.nn.Linear(768, 768).cuda()
+proj = torch.nn.Linear(768, 768).to(device)
 
 # -----------------------------
 # 5. T5 + LoRA
@@ -131,7 +136,7 @@ config = LoraConfig(
     lora_dropout=0.1,
     target_modules=["q", "v"]
 )
-t5 = get_peft_model(t5, config).cuda()
+t5 = get_peft_model(t5, config).to(device)
 
 # -----------------------------
 # 6. Training utilities
@@ -150,7 +155,8 @@ def evaluate(model, proj, vision_backbone, dataloader, tokenizer):
     
     with torch.no_grad():
         for imgs, labels in dataloader:
-            imgs = imgs.cuda()
+            imgs = imgs.to(device)
+            labels = labels.to(device)
             
             # Get image features
             with torch.no_grad():
@@ -159,7 +165,7 @@ def evaluate(model, proj, vision_backbone, dataloader, tokenizer):
             
             # Create prompts
             prompt, _ = make_text(labels.tolist())
-            enc = tokenizer(prompt, padding=True, return_tensors='pt').to('cuda')
+            enc = tokenizer(prompt, padding=True, return_tensors='pt').to(device)
             
             # Generate responses
             outputs = model.generate(
@@ -215,8 +221,9 @@ def main():
     sample_weights = [1.0 / class_counts[y] for y in train_ds.df.label]
     sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
     
-    train_dl = DataLoader(train_ds, batch_size=8, sampler=sampler, num_workers=4, pin_memory=True)
-    val_dl = DataLoader(val_ds, batch_size=8, shuffle=False, num_workers=4, pin_memory=True)
+    # Use fewer workers for CPU
+    train_dl = DataLoader(train_ds, batch_size=4, sampler=sampler, num_workers=2, pin_memory=False)
+    val_dl = DataLoader(val_ds, batch_size=4, shuffle=False, num_workers=2, pin_memory=False)
     
     # Optimizer
     opt = torch.optim.AdamW(
@@ -225,18 +232,16 @@ def main():
         weight_decay=0.01
     )
     
-    scaler = torch.cuda.amp.GradScaler()
-    
-    # Training loop
+    # Training loop - fewer epochs for CPU
     best_f1 = 0
-    for epoch in range(15):
+    for epoch in range(5):  # Reduced epochs for CPU
         t5.train()
         proj.train()
         vision_backbone.eval()
         
         total_loss = 0
         for batch_idx, (imgs, labels) in enumerate(train_dl):
-            imgs, labels = imgs.cuda(), labels.cuda()
+            imgs, labels = imgs.to(device), labels.to(device)
             
             # Get image features
             with torch.no_grad():
@@ -245,27 +250,25 @@ def main():
             
             # Prepare text
             prompt, target = make_text(labels.tolist())
-            enc = tok(prompt, padding=True, return_tensors='pt').to('cuda')
-            dec = tok(target, padding=True, truncation=True, max_length=8, return_tensors='pt').to('cuda')
+            enc = tok(prompt, padding=True, return_tensors='pt').to(device)
+            dec = tok(target, padding=True, truncation=True, max_length=8, return_tensors='pt').to(device)
             
             # Forward pass
             opt.zero_grad()
-            with torch.cuda.amp.autocast():
-                outputs = t5(
-                    input_ids=enc.input_ids,
-                    attention_mask=enc.attention_mask,
-                    labels=dec.input_ids
-                )
-                loss = outputs.loss
+            outputs = t5(
+                input_ids=enc.input_ids,
+                attention_mask=enc.attention_mask,
+                labels=dec.input_ids
+            )
+            loss = outputs.loss
             
             # Backward pass
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
+            loss.backward()
+            opt.step()
             
             total_loss += loss.item() * imgs.size(0)
             
-            if batch_idx % 50 == 0:
+            if batch_idx % 10 == 0:
                 print(f'Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}')
         
         avg_loss = total_loss / len(train_dl.dataset)
